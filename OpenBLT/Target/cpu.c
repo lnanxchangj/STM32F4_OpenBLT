@@ -191,17 +191,5 @@ void CpuMemSet(blt_addr dest, blt_int8u value, blt_int16u len)
   }
 } /*** end of CpuMemSet ***/
 
-/** \brief Disables the processor interrupts.
- */
-void CpuIrqDisable(void)
-{
-  __disable_irq();
-}
 
-/** \brief Enables the processor interrupts.
- */
-void CpuIrqEnable(void)
-{
-  __enable_irq();
-}
 /*********************************** end of cpu.c **************************************/
