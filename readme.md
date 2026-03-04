@@ -1,209 +1,619 @@
-# OpenBLT Bootloader 工程 — STM32F407
+# OpenBLT Bootloader 技术文档
 
-## 概述
+## 项目概述
 
-基于 OpenBLT 开源 Bootloader 移植到 STM32F407 平台，支持 **USART1（115200）** 和 **CAN1（500Kbps）** 双通道升级。上位机通过 XCP 协议与 Bootloader 通信，完成固件下载。
+基于 OpenBLT 开源 Bootloader 框架，为 STM32F407 平台实现多通道固件在线升级（OTA）系统。支持有线串口、CAN 总线、蓝牙 BLE 三种升级通道，搭配自研 Python 上位机工具实现完整的固件升级链路。
 
-## Flash 分区
+**目标芯片：** STM32F407VGT6 (Cortex-M4, 1MB Flash, 192KB RAM)
 
-| 区域       | 起始地址   | 大小              | 说明                   |
-| ---------- | ---------- | ----------------- | ---------------------- |
-| Bootloader | 0x08000000 | 32KB (Sector 0-1) | 固定不可被用户程序覆盖 |
-| APP        | 0x08008000 | 剩余空间          | 用户应用程序区         |
+**OpenBLT 版本：** 基于 Feaser OpenBLT（GPLv3 许可）
 
-> **注意**：F407VET6 = 512KB，F407VGT6/ZGT6 = 1024KB，请根据实际型号调整 `BOOT_NVM_SIZE_KB`。
+---
 
-## Keil 工程配置
+## 1. Flash 存储器布局
 
-**Options → Target**：
+### 1.1 STM32F407 Flash 扇区分布
 
-- IROM1: Start = `0x08000000`, Size = `0x00008000`（32KB）
-- IRAM1: 根据型号配置（F407 通常 128KB）
+STM32F407 的 1MB Flash 分为 12 个扇区，前 4 个扇区为 16KB，第 5 个为 64KB，后续均为 128KB。Bootloader 和 APP 固件分别占据不同的扇区区域，互不干扰。
 
-## 关键配置文件 blt_conf.h
+| 扇区 | 起始地址 | 大小 | 用途 |
+|------|----------|------|------|
+| Sector 0 | 0x08000000 | 16 KB | Bootloader |
+| Sector 1 | 0x08004000 | 16 KB | Bootloader |
+| Sector 2 | 0x08008000 | 16 KB | APP 起始 (向量表) |
+| Sector 3 | 0x0800C000 | 16 KB | APP |
+| Sector 4 | 0x08010000 | 64 KB | APP |
+| Sector 5 | 0x08020000 | 128 KB | APP |
+| Sector 6 | 0x08040000 | 128 KB | APP |
+| Sector 7 | 0x08060000 | 128 KB | APP |
+| Sector 8 | 0x08080000 | 128 KB | APP |
+| Sector 9 | 0x080A0000 | 128 KB | APP |
+| Sector 10 | 0x080C0000 | 128 KB | APP |
+| Sector 11 | 0x080E0000 | 128 KB | APP |
 
-### 从 F429 例程移植到 F407 的必改项
+### 1.2 地址空间划分
 
-| 配置项                              | F429 原值  | F407 修改值       | 说明                   |
-| ----------------------------------- | ---------- | ----------------- | ---------------------- |
-| `BOOT_NVM_SIZE_KB`                  | 2048       | **1024**（或512） | 按芯片型号设置         |
-| `BOOT_FLASH_VECTOR_TABLE_CS_OFFSET` | 0x1AC      | **0x188**         | F407中断数少于F429     |
-| `BOOT_COM_NET_ENABLE`               | 1          | **0**             | F407无以太网需求则关闭 |
-| `BOOT_COM_USB_ENABLE`               | 1          | **0**             | 不用USB升级则关闭      |
-| `BOOT_COM_RS232_BAUDRATE`           | 57600      | **115200**        | 按需调整               |
-| `BOOT_COM_RS232_CHANNEL_INDEX`      | 2 (USART3) | **0 (USART1)**    | 按硬件选择             |
+```
+0x08000000 ┌──────────────────────────┐
+           │      Bootloader          │
+           │      (32KB, Sector 0-1)  │
+           │                          │
+           │  不可被 OTA 覆盖         │
+           │  SWD/JTAG 烧写           │
+0x08008000 ├──────────────────────────┤ ← APP_BASE_ADDRESS
+           │      APP 向量表          │
+           │  0x08008000: 初始 SP     │
+           │  0x08008004: Reset_Handler│
+           │  0x08008008: NMI_Handler │
+           │  ...                     │
+           │  0x08008184: 最后一个 IRQ │
+           │  0x08008188: ★ Checksum  │ ← VECTOR_TABLE_CS_OFFSET
+           ├─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
+           │      APP 代码 (.text)    │
+           │      APP 常量 (.rodata)  │
+           │      APP 初始值 (.data)  │
+           │                          │
+0x080FFFFF └──────────────────────────┘
+```
 
-### 通信接口配置
+### 1.3 向量表结构
+
+ARM Cortex-M4 的向量表是一个地址数组，存放在 Flash 起始位置。CPU 上电或中断触发时，硬件自动从向量表中读取对应处理函数的地址并跳转执行。
+
+STM32F407 有 16 个系统异常 + 82 个外设中断 = 98 个向量，每个 4 字节，共 392 字节（0x188）。
+
+```
+偏移    内容                     说明
+────────────────────────────────────────
+0x000   初始栈顶指针 (MSP)       系统启动后的栈顶地址
+0x004   Reset_Handler            复位入口 (程序起点)
+0x008   NMI_Handler              不可屏蔽中断
+0x00C   HardFault_Handler        硬件错误
+0x010   MemManage_Handler        内存管理错误
+0x014   BusFault_Handler         总线错误
+0x018   UsageFault_Handler       用法错误
+0x01C   保留 (4 × 4 字节)
+0x02C   SVC_Handler              系统调用
+0x030   DebugMon_Handler         调试监控
+0x034   保留
+0x038   PendSV_Handler           可挂起系统调用
+0x03C   SysTick_Handler          系统滴答定时器
+0x040   WWDG_IRQHandler          窗口看门狗
+...     (外设中断逐一排列)
+0x184   最后一个外设中断
+0x188   ★ OpenBLT Checksum       校验和存放位置
+```
+
+每个 APP 版本编译后，函数地址不同，向量表内容也随之变化。这是 OpenBLT 选择校验向量表来判断固件完整性的基础。
+
+---
+
+## 2. Bootloader 工作原理
+
+### 2.1 启动流程
+
+```
+┌─────────────┐
+│   上电/复位   │
+└──────┬──────┘
+       ▼
+┌─────────────┐
+│  Bootloader  │
+│  BootInit()  │ ← 初始化时钟、外设、通信接口
+└──────┬──────┘
+       ▼
+┌─────────────────┐
+│   主循环         │
+│   while(1) {     │
+│     ComTask();   │ ← 监听通信接口 (串口/CAN)
+│     BackDoor();  │ ← 检查 Backdoor 超时
+│   }              │
+└──────┬──────────┘
+       ▼ (Backdoor 超时)
+┌─────────────────────┐
+│  CpuStartUserProgram │
+│                       │
+│  NvmVerifyChecksum() ─┤
+│    │                   │
+│    ├─ 校验通过 ──────► 设置 VTOR → 跳转 APP
+│    │                   (永远不返回)
+│    │
+│    └─ 校验失败 ──────► return
+│                        (留在 Bootloader, 继续等待升级)
+└───────────────────────┘
+```
+
+### 2.2 Backdoor 机制
+
+Bootloader 上电后会打开一个时间窗口（Backdoor），在此窗口内接受升级命令。超时后检查 APP 有效性并决定是否跳转。
 
 ```c
-/* 串口 */
+/* blt_conf.h 配置 */
+#define BOOT_BACKDOOR_ENTRY_TIMEOUT_MS   (500)   /* Backdoor 窗口: 500ms */
+```
+
+在 Backdoor 窗口内，如果 PC 发送了 XCP CONNECT 命令，Bootloader 会停留在升级模式，不再跳转 APP。窗口超时且无升级请求时，Bootloader 检查 APP checksum，通过则跳转。
+
+### 2.3 APP 跳转过程
+
+跳转是函数调用方式实现的，不是软复位（不调用 `NVIC_SystemReset`）：
+
+```c
+void CpuStartUserProgram(void)
+{
+    /* 1. 校验 APP checksum */
+    if (NvmVerifyChecksum() == BLT_FALSE)
+        return;     // 校验失败, 不跳转
+
+    /* 2. 释放通信接口 */
+    ComFree();
+    HAL_DeInit();
+    TimerReset();
+
+    /* 3. 重定位向量表到 APP 区域 */
+    SCB->VTOR = 0x08008000 & 0x1FFFFF80;
+
+    /* 4. 读取 APP 的 Reset_Handler 地址 */
+    pProgResetHandler = (void(*)(void))(*((uint32_t *)0x08008004));
+
+    /* 5. 使能中断 */
+    CpuIrqEnable();
+
+    /* 6. 跳转到 APP (不会返回) */
+    pProgResetHandler();
+}
+```
+
+### 2.4 Checksum 校验机制
+
+OpenBLT 使用 32 位累加和的补码作为校验算法。
+
+**写入时机：** PC 发送 `PROGRAM(len=0)` 命令（编程结束标志）时，Bootloader 调用 `FlashWriteChecksum()` 计算并写入。
+
+**计算方法：**
+
+```
+1. 从 0x08008000 开始, 每 4 字节读一个 uint32_t
+2. 累加到 0x08008184 (共 0x188 / 4 = 98 个字)
+3. 结果取补码: checksum = ~sum + 1
+4. 将 checksum 写入 0x08008188
+```
+
+**验证方法：**
+
+```
+1. 从 0x08008000 累加到 0x0800818B (包含 checksum 本身)
+2. 因为 X + (~X + 1) = 0 (补码性质)
+3. 累加结果为 0 → 校验通过
+4. 累加结果非 0 → 数据被篡改或写入不完整
+```
+
+**断电保护原理：** 升级过程中先擦除 APP 区域（全部变为 0xFF），再写入数据。如果中途断电，checksum 尚未写入（仍为 0xFF），下次上电校验必然失败，Bootloader 不会跳转到损坏的 APP，而是继续等待新的升级。
+
+---
+
+## 3. XCP 协议
+
+### 3.1 协议概述
+
+XCP（Universal Measurement and Calibration Protocol）是汽车行业标准协议，OpenBLT 使用其中的编程子集实现固件传输。协议基于一问一答的主从模式，PC（主机）发命令，MCU（从机）回应。
+
+### 3.2 传输层封装
+
+不同物理接口的封装方式不同：
+
+**串口（RS232）：** XCP 数据前加 1 字节长度
+
+```
+[Length(1B)] [XCP_Data(NB)]
+示例: 02 FF 00    → Length=2, XCP_Data={0xFF, 0x00}
+```
+
+**CAN 总线：** XCP 数据直接放入 CAN 帧 data 字段，DLC 就是长度
+
+```
+CAN_ID=0x667  DLC=2  Data={0xFF, 0x00}
+```
+
+### 3.3 升级流程与命令详解
+
+完整的固件升级由以下 XCP 命令序列完成：
+
+**Step 1: CONNECT (0xFF) — 建立连接**
+
+```
+PC → MCU:  [0xFF] [0x00]
+            │      └─ 连接模式 (0=正常)
+            └──────── 命令码 CONNECT
+
+MCU → PC:  [0xFF] [Resource] [CommMode] [MaxCTO] [MaxDTO_H] [MaxDTO_L] [ProtoVer] [TransVer]
+            │      │          │           │        │                      │           └─ 传输层版本
+            │      │          │           │        └──────────────────────└─ 协议版本
+            │      │          │           └─ 每包最大字节数 (通常=8)
+            │      │          └─ bit0: 0=小端序, 1=大端序
+            │      └─ 支持的资源 (PGM/CAL等)
+            └──────── PID=0xFF 表示 OK
+```
+
+**Step 2: PROGRAM_START (0xD2) — 进入编程模式**
+
+```
+PC → MCU:  [0xD2]
+MCU → PC:  [0xFF] [0x00] [0x00] [PGM_MaxCTO] [0x00] [0x00] [0x00]
+                                  └─ 编程模式下每包最大字节数
+```
+
+**Step 3: SET_MTA (0xF6) — 设置内存地址**
+
+```
+PC → MCU:  [0xF6] [0x00] [0x00] [0x00] [Addr_0] [Addr_1] [Addr_2] [Addr_3]
+                                         └───────── 目标地址 (小端序) ─────────┘
+MCU → PC:  [0xFF]
+```
+
+**Step 4: PROGRAM_CLEAR (0xD1) — 擦除 Flash**
+
+```
+PC → MCU:  [0xD1] [0x00] [0x00] [0x00] [Size_0] [Size_1] [Size_2] [Size_3]
+                                         └───────── 擦除大小 (小端序) ─────────┘
+MCU → PC:  [0xFF]    ← 擦除完成 (可能耗时数百毫秒)
+```
+
+**Step 5: PROGRAM (0xD0) — 写入数据（循环发送）**
+
+```
+PC → MCU:  [0xD0] [DataLen] [Data_0] [Data_1] ... [Data_N]
+            │      │         └────────── 最多 MaxCTO-2 字节 ──────┘
+            │      └─ 本次写入的数据长度
+            └──────── 命令码 PROGRAM
+MCU → PC:  [0xFF]    ← 写入成功, MTA 自动后移 DataLen 字节
+```
+
+**Step 6: PROGRAM (0xD0, len=0) — 编程结束**
+
+```
+PC → MCU:  [0xD0] [0x00]    ← DataLen=0, 表示编程结束
+MCU → PC:  [0xFF]            ← Bootloader 计算并写入 Checksum
+```
+
+此命令触发 `NvmDone()` → `FlashWriteChecksum()`，将校验和写入 0x08008188。
+
+**Step 7: PROGRAM_RESET (0xCF) — 跳转 APP**
+
+```
+PC → MCU:  [0xCF]
+MCU → PC:  (两种情况)
+    Checksum 校验通过 → 直接跳转 APP, ★不回复★ (PC 等待超时)
+    Checksum 校验失败 → 回复 [0xFF], 留在 Bootloader
+```
+
+这是整个协议中唯一一个"无回复 = 成功"的命令。
+
+### 3.4 错误响应
+
+所有命令在出错时返回统一格式：
+
+```
+MCU → PC:  [0xFE] [ErrorCode]
+            │      └─ 错误码
+            └──────── PID=0xFE 表示错误
+```
+
+常用错误码：
+
+| 代码 | 名称 | 含义 |
+|------|------|------|
+| 0x10 | CMD_BUSY | 上一条命令尚未处理完 |
+| 0x20 | CMD_UNKNOWN | 不支持的命令 |
+| 0x22 | OUT_OF_RANGE | 参数越界 |
+| 0x25 | ACCESS_LOCKED | 资源已锁定（需 Seed/Key 解锁） |
+| 0x31 | GENERIC | 通用错误（Flash 写入失败等） |
+
+---
+
+## 4. 通信接口配置
+
+### 4.1 串口 (UART4)
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 外设 | UART4 | 通过 `BOOT_COM_RS232_CHANNEL_INDEX` 选择 |
+| TX 引脚 | PC10 | AF8_UART4 |
+| RX 引脚 | PC11 | AF8_UART4 |
+| 波特率 | 115200 | `BOOT_COM_RS232_BAUDRATE` |
+| 数据格式 | 8N1 | 8 数据位, 无校验, 1 停止位 |
+
+```c
+/* blt_conf.h */
 #define BOOT_COM_RS232_ENABLE            (1)
 #define BOOT_COM_RS232_BAUDRATE          (115200)
-#define BOOT_COM_RS232_CHANNEL_INDEX     (0)        /* USART1 */
-
-/* CAN */
-#define BOOT_COM_CAN_ENABLE             (1)
-#define BOOT_COM_CAN_BAUDRATE           (500000)
-#define BOOT_COM_CAN_TX_MSG_ID          (0x7E1)
-#define BOOT_COM_CAN_RX_MSG_ID          (0x667)
-#define BOOT_COM_CAN_CHANNEL_INDEX      (0)         /* CAN1 */
+#define BOOT_COM_RS232_CHANNEL_INDEX     (3)       /* 0=USART1, 1=USART2, 2=USART3, 3=UART4 */
 ```
 
-> 两个通道同时使能时，OpenBLT 会同时监听，哪个先收到有效数据就用哪个。
+### 4.2 CAN 总线 (CAN1)
 
-### 其他默认参数说明
-
-`blt_conf.h` 中未出现的参数（如 backdoor 超时时间、APP 起始地址等），在 OpenBLT 内核源码中有默认值，无需手动配置。`blt_conf.h` 的作用是**覆盖**默认值。
-
-## CubeMX 配置要点
-
-### 时钟
-
-- HSE = 8MHz，SYSCLK = 168MHz
-- APB1 = 42MHz（CAN 波特率计算依赖此值）
-- APB2 = 84MHz（USART1 波特率计算依赖此值）
-
-### 外设
-
-- **USART1**: PB6(TX) / PB7(RX)，在 Advanced Settings 中选择 **LL 驱动**
-- **CAN1**: 按硬件原理图配置引脚，保持 **HAL 驱动**
-
-### ⚠️ 重要：USART 必须选 LL 驱动
-
-在 CubeMX → **Project Manager → Advanced Settings** 中，将 USART1 的驱动从 HAL 改为 LL。
-
-原因：OpenBLT 的 `rs232.c` 使用 LL 库操作串口，需要 `USE_FULL_LL_DRIVER` 宏定义。选择 LL 驱动后 CubeMX 会自动添加此宏，每次重新生成工程都不会丢失。
-
-## main.c 初始化顺序
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 外设 | CAN1 | `BOOT_COM_CAN_CHANNEL_INDEX` = 0 |
+| TX 引脚 | PB9 | AF9_CAN1 |
+| RX 引脚 | PI9 | AF9_CAN1 |
+| 波特率 | 500 kbps | Prescaler=6, BS1=11TQ, BS2=2TQ, APB1=42MHz |
+| PC→MCU | 0x667 | `BOOT_COM_CAN_RX_MSG_ID` |
+| MCU→PC | 0x7E1 | `BOOT_COM_CAN_TX_MSG_ID` |
+| 帧类型 | 标准帧 (11-bit) | |
 
 ```c
-HAL_Init();
-SystemClock_Config();
-MX_GPIO_Init();
-MX_USART1_UART_Init();   /* 提供 USART1 时钟 + GPIO 初始化（LL版） */
-                          /* OpenBLT 的 Rs232Init() 会再配置一次寄存器，无害 */
-/* 不要调用 MX_CAN1_Init()！ */
-/* OpenBLT 内部 CanInit() 会调用 HAL_CAN_Init()，自动触发 HAL_CAN_MspInit() */
-BootInit();
-
-while (1)
-{
-    BootTask();
-}
+/* blt_conf.h */
+#define BOOT_COM_CAN_ENABLE              (1)
+#define BOOT_COM_CAN_BAUDRATE            (500000)
+#define BOOT_COM_CAN_TX_MSG_ID           (0x7E1u)  /* MCU → PC */
+#define BOOT_COM_CAN_RX_MSG_ID           (0x667u)  /* PC → MCU */
+#define BOOT_COM_CAN_CHANNEL_INDEX       (0)        /* 0=CAN1, 1=CAN2 */
 ```
 
-**为什么不调用 MX_CAN1_Init()**：OpenBLT 的 `can.c` 内部会调用 `HAL_CAN_Init()`，该函数会自动回调 `HAL_CAN_MspInit()` 完成时钟和 GPIO 初始化。外部再调一次会导致重复初始化冲突。
+注意：CAN ID 的方向是以 Bootloader 视角命名的。在 PC 端工具中 TX/RX 方向相反——PC 的 TX_ID = Bootloader 的 RX_MSG_ID。
 
-**为什么要调用 MX_USART1_UART_Init()**：OpenBLT 的 `rs232.c` 使用 `LL_USART_Init()`，该函数**不会**触发任何 MspInit 回调，需要外部预先初始化好时钟和 GPIO。
+### 4.3 蓝牙 BLE (通过 UART4 透传)
 
-## hooks.c 关键实现
+BLE 模块（nanchang_ble）连接在 UART4 上，与有线串口复用同一物理接口。通过 `BLE_MODULE_ENABLE` 宏控制是否启用 BLE 握手状态机。
 
-### 跳转前反初始化（CpuUserProgramStartHook）
-
-**必须**在跳转 APP 前清理外设状态，否则 APP 重新初始化可能失败：
+| 参数 | 值 |
+|------|-----|
+| BLE 模块 | nanchang_ble |
+| 透传模式 | GATT Notify + Write |
+| 握手流程 | MCU 收到 "BLE_CONNECT_SUCCESS" → 发送 "AT+BLUFISEND=1" → 进入透传 |
+| 退出透传 | PC 发送 "+++"（前后各 1 秒静默） |
 
 ```c
-blt_bool CpuUserProgramStartHook(void)
-{
-  /* 关闭 USART1 */
-  LL_USART_Disable(USART1);
-  LL_APB2_GRP1_DisableClock(LL_APB2_GRP1_PERIPH_USART1);
-  HAL_GPIO_DeInit(GPIOB, GPIO_PIN_6 | GPIO_PIN_7);
-
-  /* 关闭 CAN1 */
-  HAL_CAN_Stop(&hcan1);
-  HAL_CAN_DeInit(&hcan1);
-  HAL_CAN_MspDeInit(&hcan1);
-
-  return BLT_TRUE;
-}
+/* rs232.c 顶部宏定义 */
+#define BLE_MODULE_ENABLE    (1)    /* 1=启用 BLE 握手, 0=纯串口模式 */
 ```
 
-> 需要在 hooks.c 中 `#include "can.h"` 以访问 CubeMX 生成的 `hcan1` 句柄。
+BLE 模式下，Bootloader 端负责 AT 命令握手进入透传模式，之后 PC 端通过 GATT 特征值读写即等同于串口通信。
+
+### 4.4 CAN 总线硬件连接
+
+```
+    PCAN-USB 适配器              开发板
+   ┌──────────────┐         ┌──────────────┐
+   │  CAN_H ──────┼─────────┼── CAN_H      │
+   │  CAN_L ──────┼─────────┼── CAN_L      │
+   │  GND ────────┼─────────┼── GND        │
+   └──────────────┘         └──────────────┘
+         │                          │
+     [120Ω 终端]              [120Ω 终端]
+     电阻 (两端各一个)
+```
+
+CAN 总线两端各需要一个 120Ω 终端电阻。部分 PCAN-USB 适配器和开发板可能已内置终端电阻，需根据实际硬件确认。
 
 ---
 
-## ⚠️ 踩坑记录
+## 5. Keil MDK 工程配置
 
-### 坑1：BOOT_FLASH_VECTOR_TABLE_CS_OFFSET 必须匹配芯片
+### 5.1 Bootloader 工程
 
-F429 的中断数多于 F407，向量表更长。如果沿用 F429 的 `0x1AC`，校验和位置错误，导致：
+| 配置项 | 值 |
+|--------|-----|
+| ROM 起始地址 | 0x08000000 |
+| ROM 大小 | 0x8000 (32KB) |
+| RAM 起始地址 | 0x20000000 |
+| RAM 大小 | 根据芯片型号 |
 
-- 升级后校验和验证失败
-- Bootloader 无法跳转到 APP
+### 5.2 APP 工程
 
-**F407 正确值为 `0x188`**。
+| 配置项 | 值 |
+|--------|-----|
+| ROM 起始地址 | 0x08008000 |
+| ROM 大小 | 0xF8000 (1024KB - 32KB = 992KB) |
+| RAM 起始地址 | 0x20000000 |
+| RAM 大小 | 根据芯片型号 |
 
-### 坑2：APP 启动文件必须为校验和预留空间
+APP 工程还需要修改向量表偏移：
 
-校验和写入位置 = APP起始地址 + `0x188`。F407 的向量表恰好在 `0x188` 处结束，如果不预留空间，**校验和会覆盖 APP 代码的第一个字节**。
-
-**解决**：在 APP 工程的 `startup_stm32f407xx.s` 向量表末尾添加保留字：
-
-```asm
-              DCD     FPU_IRQHandler            ; FPU
-              DCD     0                         ; Reserved for OpenBLT checksum
-__Vectors_End
+```c
+/* system_stm32f4xx.c */
+#define VECT_TAB_OFFSET  0x8000    /* 向量表偏移到 0x08008000 */
 ```
 
-### 坑3：CubeMX 重新生成会丢失 USE_FULL_LL_DRIVER
+三者必须一致：Bootloader 的 `flashLayout` 第一个 APP 扇区地址、APP 工程的 ROM 起始地址、`VECT_TAB_OFFSET` 的值。任何一个不匹配都会导致升级后 APP 无法运行。
 
-在 CubeMX 的 Advanced Settings 中将 USART 切换为 LL 驱动即可永久解决。
+### 5.3 固件输出配置
 
-### 坑4：Keil 直烧 APP 无法跳转
+在 Keil 的 User 选项卡中配置 After Build 命令，生成 SREC 格式固件文件：
 
-Keil 直烧不会写入 OpenBLT 校验和。**开发调试**阶段可临时启用 `BOOT_NVM_CHECKSUM_HOOKS_ENABLE = 1` 并在 hooks 中返回 `BLT_TRUE` 跳过校验。**正式发布前必须改回 0**。
+```
+fromelf --m32 --output="app_firmware.srec" ".\Objects\app.axf"
+```
 
-### 坑5：跳转前未反初始化外设
-
-如果 `CpuUserProgramStartHook()` 不做任何清理就返回 `BLT_TRUE`，APP 重新初始化串口/CAN 时可能进入异常状态（外设已处于使能状态、GPIO 复用冲突等）。
-
-### 坑6：NET_DEFERRED_INIT_ENABLE 残留
-
-关闭 NET 后建议将 `BOOT_COM_NET_DEFERRED_INIT_ENABLE` 也改为 0，避免混淆。
+或在 Output 选项卡勾选 "Create HEX File"。
 
 ---
 
-## 量产烧录
+## 6. PC 上位机工具
 
-### 方案一：两步烧录（推荐）
+### 6.1 官方工具
 
-1. 编程器烧录 Bootloader 到 0x08000000
-2. 用 BootCommander 命令行工具通过串口/CAN 刷入 APP：
+OpenBLT 自带两个 PC 工具：
+
+**BootCommander (命令行)：**
+
+```cmd
+rem CAN 升级
+BootCommander.exe -s=xcp -t=xcp_can -d=peak_pcanusb -b=500000 -tid=0x667 -rid=0x7e1 firmware.srec
+
+rem 串口升级
+BootCommander.exe -s=xcp -t=xcp_rs232 -d=COM3 -b=115200 firmware.srec
+```
+
+| 参数 | CAN | 串口 |
+|------|-----|------|
+| -t | xcp_can | xcp_rs232 |
+| -d | peak_pcanusb | COMx |
+| -b | CAN 波特率 | UART 波特率 |
+| -tid | PC 发送 CAN ID | 不需要 |
+| -rid | PC 接收 CAN ID | 不需要 |
+
+**MicroBoot (GUI)：** 图形化升级工具，基于 Delphi/Lazarus 开发。
+
+### 6.2 自研 Python 上位机
+
+基于 Python + PyQt5 开发的多通道升级工具，支持有线串口、CAN 总线、BLE 蓝牙三种模式。
+
+**文件结构：**
+
+| 文件 | 功能 | 依赖库 |
+|------|------|--------|
+| main.py | 程序入口 | PyQt5 |
+| main_window.py | GUI 界面与业务逻辑 | PyQt5 |
+| xcp_master.py | XCP 协议实现 + 串口传输层 | pyserial |
+| can_transport.py | CAN 传输层 | python-can |
+| ble_transport.py | BLE 传输层 | bleak |
+| firmware_parser.py | SREC/HEX 固件解析 | 无 |
+
+**安装依赖：**
 
 ```bash
-BootCommander -s=xcp -t=xcp_rs232 -d=COM3 -b=115200 app_firmware.srec
+pip install PyQt5 pyserial python-can bleak
 ```
 
-### 方案二：合并一次性烧录
+**运行：**
 
-1. 用 `SRecChecksumTool` 给 APP 固件写入校验和
-2. 用 `srec_cat` 合并 Bootloader + APP
-3. 编程器一次性烧录合并文件
+```bash
+python main.py
+```
 
-### 方案三：开发调试专用
-
-启用 `BOOT_NVM_CHECKSUM_HOOKS_ENABLE = 1`，Keil 分别直烧两个工程。**仅限开发阶段**。
+**架构设计：** 三种传输层（SerialTransport / CanTransport / BleTransport）实现相同的接口（`send_packet` / `receive_packet` / `drain`），XcpMaster 通过统一接口调用，不感知底层物理通道。
 
 ---
 
-## 文件结构
+## 7. 升级操作指南
 
+### 7.1 串口升级
+
+1. 用 USB 转 TTL 连接 PC 的 COM 口到 MCU 的 UART4 (PC10/PC11)
+2. 开发板上电（Bootloader 进入 Backdoor 等待）
+3. 在 Backdoor 超时前（默认 500ms）执行升级命令或点击上位机「开始升级」
+
+### 7.2 CAN 升级
+
+1. 连接 PCAN-USB 适配器的 CAN_H/CAN_L 到开发板
+2. 确认两端终端电阻（120Ω）
+3. 安装 PEAK 官方驱动（Windows 需要管理员权限）
+4. 开发板上电
+5. 在 Backdoor 超时前执行升级
+
+### 7.3 BLE 升级
+
+1. 开发板上电（BLE 模块开始广播）
+2. PC 扫描并连接 nanchang_ble 设备
+3. BLE 模块发送 "BLE_CONNECT_SUCCESS" → MCU 自动发 AT 命令进入透传
+4. PC 通过 GATT 透传通道执行标准 XCP 升级流程
+5. 升级完成后 PC 发送 "+++" 退出透传模式
+
+### 7.4 升级速度参考
+
+| 通道 | 实测速度 | 瓶颈 |
+|------|----------|------|
+| 有线串口 (115200) | ~7 KB/s | XCP 一问一答协议开销 |
+| CAN (500kbps) | ~5-8 KB/s | XCP 协议开销 + 8 字节帧限制 |
+| BLE 透传 | ~0.9 KB/s | BLE 物理层带宽限制 |
+
+---
+
+## 8. 安全机制
+
+### 8.1 断电保护
+
+升级过程中任意时刻断电，Bootloader 自身不受影响（位于独立的 Flash 扇区，升级过程不会擦写 Bootloader 区域）。重新上电后，Bootloader 检查 APP checksum，因数据不完整校验必然失败，自动留在升级等待模式，可再次执行升级。
+
+### 8.2 刷错固件保护
+
+OpenBLT 本身不校验固件与目标硬件的匹配性。如果将 A 板的固件刷到 B 板上，Bootloader 不会拒绝。写入完成后 checksum 校验通过（因为数据本身是完整的），APP 会被执行但行为异常。
+
+但这不会损坏 Bootloader——异常的 APP 不影响 Bootloader 区域，重新上电仍可再次升级刷入正确的固件。
+
+建议在 APP 固件中加入硬件身份标识（board_id），由上位机在升级前校验。
+
+### 8.3 Seed/Key 保护（可选）
+
+OpenBLT 支持 Seed/Key 认证机制，启用后 PC 必须提供正确的密钥才能执行编程操作。通过 `blt_conf.h` 中 `XCP_SEED_KEY_PROTECTION_EN` 启用。
+
+---
+
+## 9. blt_conf.h 关键配置汇总
+
+```c
+/* -------- Backdoor -------- */
+#define BOOT_BACKDOOR_ENTRY_TIMEOUT_MS   (500)
+
+/* -------- 串口 (UART4) -------- */
+#define BOOT_COM_RS232_ENABLE            (1)
+#define BOOT_COM_RS232_BAUDRATE          (115200)
+#define BOOT_COM_RS232_CHANNEL_INDEX     (3)       /* UART4 */
+
+/* -------- CAN (CAN1) -------- */
+#define BOOT_COM_CAN_ENABLE              (1)
+#define BOOT_COM_CAN_BAUDRATE            (500000)
+#define BOOT_COM_CAN_TX_MSG_ID           (0x7E1u)  /* MCU→PC */
+#define BOOT_COM_CAN_RX_MSG_ID           (0x667u)  /* PC→MCU */
+#define BOOT_COM_CAN_CHANNEL_INDEX       (0)        /* CAN1 */
+
+/* -------- Flash -------- */
+#define BOOT_NVM_SIZE_OPTIMIZATION_EN    (1)
+#define BOOT_FLASH_VECTOR_TABLE_CS_OFFSET (0x188)  /* Checksum 偏移 */
+
+/* -------- XCP -------- */
+#define BOOT_COM_RX_MAX_DATA             (8)
+#define BOOT_COM_TX_MAX_DATA             (8)
 ```
-Bootloader/
-├── Core/
-│   ├── Src/
-│   │   ├── main.c          # 入口，初始化 + BootInit/BootTask
-│   │   └── hooks.c         # Bootloader 回调（deinit、backdoor等）
-│   └── Inc/
-│       └── blt_conf.h      # Bootloader 配置（通信、Flash、看门狗等）
-├── Lib/
-│   └── OpenBLT/Source/      # OpenBLT 内核源码（不要修改）
-│       ├── ARMCM4_STM32F4/
-│       │   ├── rs232.c     # 串口驱动（LL库）
-│       │   ├── can.c       # CAN驱动（HAL库）
-│       │   ├── cpu.c       # CPU控制 + APP跳转逻辑
-│       │   └── flash.c     # Flash擦写 + 校验和
-│       └── ...
-└── STM32F407.ioc            # CubeMX 工程文件
-```
+
+---
+
+## 10. 故障排查
+
+### 10.1 BootCommander 报"拒绝访问"
+
+Windows 下 PCAN-USB 驱动需要管理员权限。以管理员身份运行 CMD，或检查 BootCommander.exe 文件大小是否为 0（文件损坏）。
+
+### 10.2 升级后 APP 不运行
+
+排查方向（按优先级）：
+
+1. APP 工程的 ROM 起始地址是否为 0x08008000
+2. `VECT_TAB_OFFSET` 是否设置为 0x8000
+3. Bootloader 的 `flashLayout` 首个 APP 扇区是否从 0x08008000 开始
+4. 固件文件是否为 SREC/HEX 格式（不是 bin 或 axf）
+5. 使用 ST-LINK 读取 0x08008000 处的内容，确认数据已正确写入
+
+### 10.3 CAN 通信无响应
+
+1. 确认 CAN_H/CAN_L 接线正确（未反接）
+2. 确认两端终端电阻（120Ω）已就位
+3. 确认波特率一致（PC 端和 blt_conf.h）
+4. 确认 CAN ID 方向正确（PC 的 TX = Bootloader 的 RX）
+5. 使用 PCAN-View 等工具确认总线上有数据
+
+### 10.4 串口通信无响应
+
+1. 确认 TX/RX 交叉连接（PC 的 TX → MCU 的 RX，反之亦然）
+2. 确认波特率一致
+3. 确认 `BOOT_COM_RS232_CHANNEL_INDEX` 指向正确的 UART 外设
+4. 确认 MspInit 中 GPIO 配置正确
+
+### 10.5 下载固件到错误地址
+
+如果固件 SREC 文件中的地址不在 `flashLayout` 定义的可写区域内，OpenBLT 会拒绝写入并返回 `XCP_ERR_GENERIC` 错误。确保 APP 工程的链接地址与 Bootloader 的 Flash 分区表一致。
+
+---
+
+## 11. 参考资料
+
+| 资源 | 链接 |
+|------|------|
+| OpenBLT 官网 | https://www.feaser.com/openblt/doku.php |
+| OpenBLT 下载 | https://www.feaser.com/openblt/doku.php?id=downloads |
+| XCP 协议规范 | ASAM XCP 标准 (www.asam.net) |
+| STM32F407 参考手册 | RM0090 (ST 官网) |
+| python-can 文档 | https://python-can.readthedocs.io |
+| PEAK PCAN 驱动 | https://www.peak-system.com/Downloads.76.0.html |

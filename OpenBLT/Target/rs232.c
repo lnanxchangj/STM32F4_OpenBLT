@@ -91,7 +91,7 @@
 /** \brief Enable(1)/disable(0) BLE module transparent-mode handshake on the RS232
  *         channel. Set to 0 for plain UART upgrade without BLE.
  */
-#define BLE_MODULE_ENABLE  1
+#define BLE_MODULE_ENABLE  0
 
 
 #if (BLE_MODULE_ENABLE == 1)
