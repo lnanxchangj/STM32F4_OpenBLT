@@ -146,7 +146,7 @@
 /** \brief Configure the desired communication speed. */
 #define BOOT_COM_RS232_BAUDRATE          (115200)
 /** \brief Select the desired UART peripheral as a zero based index. */
-#define BOOT_COM_RS232_CHANNEL_INDEX     (0)
+#define BOOT_COM_RS232_CHANNEL_INDEX     (3)
 
 
 /****************************************************************************************
@@ -163,7 +163,7 @@
 /** \brief Enable/disable the backdoor override hook functions. */
 #define BOOT_BACKDOOR_HOOKS_ENABLE      (0)
 
-
+#define BOOT_BACKDOOR_ENTRY_TIMEOUT_MS   (10000)
 /****************************************************************************************
 *   N O N - V O L A T I L E   M E M O R Y   D R I V E R   C O N F I G U R A T I O N
 ****************************************************************************************/
