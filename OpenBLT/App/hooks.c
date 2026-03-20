@@ -172,52 +172,6 @@ blt_bool BackDoorEntryHook(void)
 
   return result;
 } /*** end of BackDoorEntryHook ***/
-
-
-/************************************************************************************//**
-** \brief     Reads device information from flash.
-** \param     type    Pointer to store board type ID.
-** \param     hwVer   Pointer to store hardware version.
-** \param     blVer   Pointer to store bootloader version.
-** \return    none.
-**
-****************************************************************************************/
-void DeviceInfoRead(uint8_t *type, uint16_t *hwVer, uint16_t *blVer)
-{
-  if (type != BLT_NULL)
-  {
-    *type = (uint8_t)(DEVICE_INFO_BOARD_TYPE & 0xFF);
-  }
-  if (hwVer != BLT_NULL)
-  {
-    /* firmware version v1.0.0.0: store major.minor in hwVer for compatibility */
-    uint8_t fw_major = (uint8_t)((DEVICE_INFO_FW_VERSION >> 24) & 0xFF);
-    uint8_t fw_minor = (uint8_t)((DEVICE_INFO_FW_VERSION >> 16) & 0xFF);
-    *hwVer = (fw_major << 8) | fw_minor;
-  }
-  if (blVer != BLT_NULL)
-  {
-    /* bootloader version not stored, return 0 */
-    *blVer = 0;
-  }
-} /*** end of DeviceInfoRead ***/
-
-
-/************************************************************************************//**
-** \brief     Sets the upgrade flag and triggers a soft reset.
-** \details   Called by APP when it wants to enter upgrade mode.
-**            This sets the RTC backup flag and resets the MCU.
-** \return    none. (Does not return - triggers reset)
-**
-****************************************************************************************/
-void RequestEnterUpgradeMode(void)
-{
-  /* Set upgrade flag in RTC Backup Register 0 */
-  RTC_BKP_DR0_Write(UPGRADE_FLAG_VALUE);
-
-  /* Trigger software reset */
-  NVIC_SystemReset();
-} /*** end of RequestEnterUpgradeMode ***/
 #endif /* BOOT_BACKDOOR_HOOKS_ENABLE > 0 */
 
 
@@ -237,14 +191,6 @@ void RequestEnterUpgradeMode(void)
 ****************************************************************************************/
 blt_bool CpuUserProgramStartHook(void)
 {
-  /* Direct register access for USART1 deinit */
-  volatile uint32_t *pUSART1_CR1 = (volatile uint32_t *)(0x40011000);  /* USART1 base */
-  *pUSART1_CR1 = 0;  /* Disable USART1 */
-
-  /* Direct register access for CAN1 deinit */
-  volatile uint32_t *pCAN1_MCR = (volatile uint32_t *)(0x40006400);  /* CAN1 base */
-  *pCAN1_MCR = (1 << 1);  /* INRQ=1 to enter init mode */
-
   return BLT_TRUE;
 } /*** end of CpuUserProgramStartHook ***/
 #endif /* BOOT_CPU_USER_PROGRAM_START_HOOK > 0 */
