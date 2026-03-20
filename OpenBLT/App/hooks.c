@@ -30,8 +30,88 @@
 * Include files
 ****************************************************************************************/
 #include "boot.h"                                /* bootloader generic header          */
-#include "stm32f4xx_hal.h"                       /* STM32 registers and drivers        */
 #include "can.h"
+
+
+/****************************************************************************************
+*   D E V I C E   I N F O   D E F I N E S
+****************************************************************************************/
+/** \brief Device info storage addresses (in Sector 4, 0x08010000).
+ *         These are located at the end of Sector 4 to avoid conflicting with
+ *         bootloader code. Sector 4 is 64KB = 0x10000, ending at 0x0801FFFF.
+ */
+#define DEVICE_INFO_ADDR           (0x0801FF00)
+#define DEVICE_INFO_BOARD_TYPE     (*(volatile uint32_t *)(0x0801FF00))  /* 4 bytes */
+#define DEVICE_INFO_HW_VERSION     (*(volatile uint32_t *)(0x0801FF04))  /* 4 bytes */
+#define DEVICE_INFO_BL_VERSION     (*(volatile uint32_t *)(0x0801FF08))  /* 4 bytes */
+#define DEVICE_INFO_SERIAL         (0x0801FF0C)                           /* 16 bytes */
+#define DEVICE_INFO_NAME           (0x0801FF1C)                           /* 32 bytes */
+
+/** \brief RTC Backup Register for upgrade flag (uses RTC_BKP_DR0).
+ *         Address: 0x40002850 (STM32F4 RTC_BKP_DR0)
+ */
+#define RTC_BKP_DR0_ADDR           (0x40002850)
+#define UPGRADE_FLAG_VALUE         (0xDEADBEEF)
+
+/** \brief Board Type IDs */
+typedef enum {
+    BOARD_TYPE_UNKNOWN = 0x00,
+    BOARD_TYPE_CTRL    = 0x01,  /* Control board */
+    BOARD_TYPE_DRIVER  = 0x02,  /* Driver board */
+    BOARD_TYPE_SENSOR  = 0x03,  /* Sensor board */
+} BoardType;
+
+
+/****************************************************************************************
+*   L O C A L   F U N C T I O N S
+****************************************************************************************/
+/************************************************************************************//**
+** \brief     Reads a value from RTC Backup Register.
+** \param     none.
+** \return    The 32-bit value stored in RTC_BKP_DR0.
+**
+****************************************************************************************/
+static uint32_t RTC_BKP_DR0_Read(void)
+{
+  return *(volatile uint32_t *)RTC_BKP_DR0_ADDR;
+} /*** end of RTC_BKP_DR0_Read ***/
+
+
+/************************************************************************************//**
+** \brief     Writes a value to RTC Backup Register 0.
+** \param     value   The 32-bit value to write.
+** \return    none.
+**
+****************************************************************************************/
+static void RTC_BKP_DR0_Write(uint32_t value)
+{
+  *(volatile uint32_t *)RTC_BKP_DR0_ADDR = value;
+} /*** end of RTC_BKP_DR0_Write ***/
+
+
+/************************************************************************************//**
+** \brief     Enables access to RTC Backup registers.
+** \details   Direct register access for STM32F4 Bootloader compatibility.
+**            Uses bitband access for reliable register writes.
+** \return    none.
+**
+****************************************************************************************/
+static void EnableBackupAccess(void)
+{
+  /* STM32F4 register addresses */
+  volatile uint32_t *pRCC_APB1ENR = (volatile uint32_t *)(0x40023820);  /* RCC APB1 enable */
+  volatile uint32_t *pPWR_CR = (volatile uint32_t *)(0x40007000);          /* PWR control */
+  volatile uint32_t *pRCC_BDCR = (volatile uint32_t *)(0x40023870);       /* RCC backup domain control */
+
+  /* 1. Enable PWR clock (RCC_APB1ENR bit 28 - PWREN) */
+  *pRCC_APB1ENR = *pRCC_APB1ENR | (1U << 28);
+
+  /* 2. Set DBP bit in PWR_CR (bit 8) to enable backup domain write access */
+  *pPWR_CR = *pPWR_CR | (1U << 8);
+
+  /* 3. Enable RTC clock (RCC_BDCR bit 15 - RTCEN) */
+  *pRCC_BDCR = *pRCC_BDCR | (1U << 15);
+} /*** end of EnableBackupAccess ***/
 
 
 /****************************************************************************************
@@ -46,6 +126,8 @@
 ****************************************************************************************/
 void BackDoorInitHook(void)
 {
+  /* Enable backup domain access for RTC registers */
+  EnableBackupAccess();
 } /*** end of BackDoorInitHook ***/
 
 
@@ -53,12 +135,83 @@ void BackDoorInitHook(void)
 ** \brief     Checks if a backdoor entry is requested.
 ** \return    BLT_TRUE if the backdoor entry is requested, BLT_FALSE otherwise.
 **
+** \details   Implements seamless jump using RTC Backup Register:
+**            - Normal power-on/reset: RTC_BKP_DR0 = 0, verify APP checksum and jump (0 delay)
+**            - APP requests upgrade: Set flag 0xDEADBEEF + soft reset, BL stays in upgrade mode
+**            - If upgrade interrupted by power loss: flag lost, BL verifies APP checksum
+**
 ****************************************************************************************/
 blt_bool BackDoorEntryHook(void)
 {
-  /* default implementation always activates the bootloader after a reset */
-  return BLT_TRUE;
+  blt_bool result = BLT_TRUE;
+
+  /* Check if upgrade flag is set in RTC Backup Register 0 */
+  if (RTC_BKP_DR0_Read() == UPGRADE_FLAG_VALUE)
+  {
+    /* Upgrade was requested - clear flag and stay in bootloader */
+    RTC_BKP_DR0_Write(0);
+    result = BLT_TRUE;  /* Stay in bootloader for upgrade */
+  }
+  else
+  {
+    /* No upgrade flag - verify APP checksum and jump immediately (0 delay) */
+    if (NvmVerifyChecksum() == BLT_TRUE)
+    {
+      /* Valid APP found - return BLT_FALSE to skip backdoor timeout
+       * and let CpuStartUserProgram() handle the jump immediately */
+      result = BLT_FALSE;
+    }
+    else
+    {
+      /* No valid APP - stay in bootloader */
+      result = BLT_TRUE;
+    }
+  }
+
+  return result;
 } /*** end of BackDoorEntryHook ***/
+
+
+/************************************************************************************//**
+** \brief     Reads device information from flash.
+** \param     type    Pointer to store board type ID.
+** \param     hwVer   Pointer to store hardware version.
+** \param     blVer   Pointer to store bootloader version.
+** \return    none.
+**
+****************************************************************************************/
+void DeviceInfoRead(uint8_t *type, uint16_t *hwVer, uint16_t *blVer)
+{
+  if (type != BLT_NULL)
+  {
+    *type = (uint8_t)(DEVICE_INFO_BOARD_TYPE & 0xFF);
+  }
+  if (hwVer != BLT_NULL)
+  {
+    *hwVer = (uint16_t)(DEVICE_INFO_HW_VERSION & 0xFFFF);
+  }
+  if (blVer != BLT_NULL)
+  {
+    *blVer = (uint16_t)(DEVICE_INFO_BL_VERSION & 0xFFFF);
+  }
+} /*** end of DeviceInfoRead ***/
+
+
+/************************************************************************************//**
+** \brief     Sets the upgrade flag and triggers a soft reset.
+** \details   Called by APP when it wants to enter upgrade mode.
+**            This sets the RTC backup flag and resets the MCU.
+** \return    none. (Does not return - triggers reset)
+**
+****************************************************************************************/
+void RequestEnterUpgradeMode(void)
+{
+  /* Set upgrade flag in RTC Backup Register 0 */
+  RTC_BKP_DR0_Write(UPGRADE_FLAG_VALUE);
+
+  /* Trigger software reset */
+  NVIC_SystemReset();
+} /*** end of RequestEnterUpgradeMode ***/
 #endif /* BOOT_BACKDOOR_HOOKS_ENABLE > 0 */
 
 
@@ -78,13 +231,13 @@ blt_bool BackDoorEntryHook(void)
 ****************************************************************************************/
 blt_bool CpuUserProgramStartHook(void)
 {
-  LL_USART_Disable(USART1);
-  LL_APB2_GRP1_DisableClock(LL_APB2_GRP1_PERIPH_USART1);
-  HAL_GPIO_DeInit(GPIOB, GPIO_PIN_6 | GPIO_PIN_7);
+  /* Direct register access for USART1 deinit */
+  volatile uint32_t *pUSART1_CR1 = (volatile uint32_t *)(0x40011000);  /* USART1 base */
+  *pUSART1_CR1 = 0;  /* Disable USART1 */
 
-  HAL_CAN_Stop(&hcan1);
-  HAL_CAN_DeInit(&hcan1);
-  HAL_CAN_MspDeInit(&hcan1);
+  /* Direct register access for CAN1 deinit */
+  volatile uint32_t *pCAN1_MCR = (volatile uint32_t *)(0x40006400);  /* CAN1 base */
+  *pCAN1_MCR = (1 << 1);  /* INRQ=1 to enter init mode */
 
   return BLT_TRUE;
 } /*** end of CpuUserProgramStartHook ***/

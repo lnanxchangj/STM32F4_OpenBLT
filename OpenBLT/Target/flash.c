@@ -137,19 +137,16 @@ static blt_int8u FlashGetSector(blt_addr address);
  */
 static const tFlashSector flashLayout[] =
 {
-  /* space is reserved for a bootloader configuration with all supported communication
-   * interfaces enabled. when for example only UART is needed, then the space required
-   * for the bootloader can be made a lot smaller here.
+  /* APP starts at Sector 5 (0x08020000), leaving Sectors 0-4 for bootloader.
+   * Sector 4 (0x08010000, 64KB) upper region is used for device info storage:
+   *   0x0801FF00 - Board Type ID (4 bytes)
+   *   0x0801FF04 - Hardware Version (4 bytes)
+   *   0x0801FF08 - Bootloader Version (4 bytes)
+   *   0x0801FF0C - Serial Number (16 bytes)
+   *   0x0801FF1C - Device Name (32 bytes)
    */
-  /* { 0x08000000, 0x04000,  0},           flash sector  0 - reserved for bootloader   */
-  /* { 0x08004000, 0x04000,  1},           flash sector  1 - reserved for bootloader   */
-  { 0x08008000, 0x04000,  2},           /* flash sector  2 -  16kb                     */
-  { 0x0800c000, 0x04000,  3},           /* flash sector  3 -  16kb                     */
-#if (BOOT_NVM_SIZE_KB > 64)
-  { 0x08010000, 0x10000,  4},           /* flash sector  4 -  64kb                     */
-#endif
 #if (BOOT_NVM_SIZE_KB > 128)
-  { 0x08020000, 0x20000,  5},           /* flash sector  5 - 128kb                     */
+  { 0x08020000, 0x20000,  5},           /* flash sector  5 - 128kb - APP START         */
 #endif
 #if (BOOT_NVM_SIZE_KB > 256)
   { 0x08040000, 0x20000,  6},           /* flash sector  6 - 128kb                     */
