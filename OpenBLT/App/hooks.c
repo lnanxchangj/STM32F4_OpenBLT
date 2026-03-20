@@ -42,10 +42,9 @@
  */
 #define DEVICE_INFO_ADDR           (0x0801FF00)
 #define DEVICE_INFO_BOARD_TYPE     (*(volatile uint32_t *)(0x0801FF00))  /* 4 bytes */
-#define DEVICE_INFO_HW_VERSION     (*(volatile uint32_t *)(0x0801FF04))  /* 4 bytes */
-#define DEVICE_INFO_BL_VERSION     (*(volatile uint32_t *)(0x0801FF08))  /* 4 bytes */
-#define DEVICE_INFO_SERIAL         (0x0801FF0C)                           /* 16 bytes */
-#define DEVICE_INFO_NAME           (0x0801FF1C)                           /* 32 bytes */
+#define DEVICE_INFO_FW_VERSION     (*(volatile uint32_t *)(0x0801FF04))  /* 4 bytes: major.minor.revision.build */
+#define DEVICE_INFO_SERIAL         (0x0801FF08)                           /* 16 bytes */
+#define DEVICE_INFO_NAME           (0x0801FF18)                           /* variable length, null-terminated */
 
 /** \brief RTC Backup Register for upgrade flag (uses RTC_BKP_DR0).
  *         Address: 0x40002850 (STM32F4 RTC_BKP_DR0)
@@ -55,10 +54,13 @@
 
 /** \brief Board Type IDs */
 typedef enum {
-    BOARD_TYPE_UNKNOWN = 0x00,
-    BOARD_TYPE_CTRL    = 0x01,  /* Control board */
-    BOARD_TYPE_DRIVER  = 0x02,  /* Driver board */
-    BOARD_TYPE_SENSOR  = 0x03,  /* Sensor board */
+    BOARD_TYPE_UNKNOWN   = 0x00,
+    BOARD_TYPE_MASTER    = 0x01,  /* 主控板 */
+    BOARD_TYPE_ARM       = 0x02,  /* 机械臂 */
+    BOARD_TYPE_TEST      = 0x03,  /* 测试板 */
+    BOARD_TYPE_PREPROCESS = 0x04,  /* 预处理板 */
+    BOARD_TYPE_TEMPCTRL  = 0x05,  /* 温控板 */
+    BOARD_TYPE_COOLING   = 0x06,  /* 制冷板 */
 } BoardType;
 
 
@@ -188,11 +190,15 @@ void DeviceInfoRead(uint8_t *type, uint16_t *hwVer, uint16_t *blVer)
   }
   if (hwVer != BLT_NULL)
   {
-    *hwVer = (uint16_t)(DEVICE_INFO_HW_VERSION & 0xFFFF);
+    /* firmware version v1.0.0.0: store major.minor in hwVer for compatibility */
+    uint8_t fw_major = (uint8_t)((DEVICE_INFO_FW_VERSION >> 24) & 0xFF);
+    uint8_t fw_minor = (uint8_t)((DEVICE_INFO_FW_VERSION >> 16) & 0xFF);
+    *hwVer = (fw_major << 8) | fw_minor;
   }
   if (blVer != BLT_NULL)
   {
-    *blVer = (uint16_t)(DEVICE_INFO_BL_VERSION & 0xFFFF);
+    /* bootloader version not stored, return 0 */
+    *blVer = 0;
   }
 } /*** end of DeviceInfoRead ***/
 
